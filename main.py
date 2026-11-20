@@ -51,6 +51,8 @@ DECAY_GRID = [0.0, 0.3, 0.6, 0.9, 1.2, 1.6, 2.2]
 SCALE_GRID = [0.6, 0.75, 0.9, 1.1, 1.35, 1.7, 2.2]
 PRIOR_PULL = 0.05
 BACKTEST_WEIGHT = 0.3
+CLASS_SHRINK = 3.0  # pseudo-trophies at zero offset in each class mean
+COMPLETE_PACE = 0.5
 BACKTEST_CUTS_H = [18.0, 24.0, 30.0]
 OWN_SHARE = 0.5  # share of a trophy's own deviation from the pooled velocity it keeps
 PLAYERS_DAMP = 0.7
@@ -129,12 +131,24 @@ def young_forecast(trophies: list, last_rates: list) -> dict:
     return {"trophies": rows}
 
 
+def trophy_kind(t: dict) -> str:
+    """story: a hidden trophy for completing a mission or chapter; complete: the platinum or a 100% completion;
+    other: side content."""
+    desc = (t.get("description") or "").lower()
+    if t.get("tier") == "platinum" or "100%" in desc:
+        return "complete"
+    if t.get("secret") and desc.startswith("complete"):
+        return "story"
+    return "other"
+
+
 class Fit:
     """The model fitted on the pages up to some moment: each trophy's probit path, the pooled velocity line and
     the trend of the players tracked."""
 
-    def __init__(self, snaps: list, n0: int, c0: list, K: int):
+    def __init__(self, snaps: list, n0: int, c0: list, kinds: list):
         self.ok = False
+        K = len(kinds)
         last_t, last_n, _ = snaps[-1]
         fit = []
         for window in FIT_WINDOWS_H:  # widen the window when Exophase refreshed rarely
@@ -143,7 +157,7 @@ class Fit:
                 break
         if len(fit) < 3 or fit[-1][0] - fit[0][0] < 4:
             return
-        self.ok, self.n0, self.c0, self.K, self.fit = True, n0, c0, K, fit
+        self.ok, self.n0, self.c0, self.K, self.fit, self.kinds = True, n0, c0, K, fit, kinds
         self.last_t, self.last_n = last_t, last_n
         xs = [logu(s[0]) for s in fit]
         ws = [1.0 + i / len(fit) for i in range(len(fit))]
@@ -182,6 +196,14 @@ class Fit:
             alpha, beta, zlo, zhi, vsd = 0.5, 0.0, -9.0, 9.0, 0.8
         self.alpha, self.beta, self.zlo, self.zhi, self.vsd = alpha, beta, zlo, zhi, vsd
 
+        # Story trophies (everyone plays the story) and side content may move at different speeds at one level:
+        # each class's mean residual from the pooled line, shrunk by how many trophies show it.
+        self.offset = {}
+        for kind in ("story", "other", "complete"):
+            members = [k for k in inf if kinds[k] == kind]
+            res = [self.paths[k]["b"] - self.velocity(self.paths[k]["z_mid"]) for k in members]
+            self.offset[kind] = sum(res) / (len(res) + CLASS_SHRINK) if res else 0.0
+
     def genuine(self, s, k):
         new = max(1, s[1] - self.n0)
         return max(0.0, rate_of(s[2], k) * s[1] / 100 - self.c0[k]), new
@@ -201,12 +223,16 @@ class Fit:
                 out.append([99.95, 100, 100, 100, 100])
                 continue
             informative = k in self.informative
-            own = (p["b"] - self.velocity(p["z_mid"])) * OWN_SHARE if informative else 0.0
+            kind = self.kinds[k]
+            base = self.offset[kind]
+            own = (p["b"] - self.velocity(p["z_mid"]) - base) * OWN_SHARE if informative else 0.0
+            # Platinum and 100% completion need nearly everything else: they climb at a fraction of the pace.
+            pace = COMPLETE_PACE if kind == "complete" else 1.0
             # The velocity decays exponentially along log time (new players join with no progress, play slows).
             decay = decay_inf if informative else decay_uninf
             z, steps = p["z_last"], 40
             for i in range(steps):
-                z += math.exp(-decay * du * (i + 0.5) / steps) * (self.velocity(z) + own) * du / steps
+                z += pace * math.exp(-decay * du * (i + 0.5) / steps) * (self.velocity(z) + base + own) * du / steps
             extra = 0.0 if informative else 0.4
             sd = scale * math.sqrt((self.vsd * du) ** 2 + RW_SIGMA**2 * du + p["sd"] ** 2 + (extra * du) ** 2 + 0.01)
             out.append([100 * (self.c0[k] + ND.cdf(z + zq * sd) * n_new_t) / n_t for zq in Z])
@@ -218,7 +244,7 @@ def pinball_logit(y: float, q: float, tau: float) -> float:
     return 2 * max(tau * d, (tau - 1) * d)
 
 
-def backtest(snaps: list, n0: int, c0: list, K: int) -> tuple:
+def backtest(snaps: list, n0: int, c0: list, kinds: list) -> tuple:
     """Choose the velocity decay (informative and thin trophies) and the spread scale by forecasting the last
     page from earlier cuts of this very history, scored with the contest's own loss; shrunk toward the prior."""
     last_t, _, last_rates = snaps[-1]
@@ -226,7 +252,7 @@ def backtest(snaps: list, n0: int, c0: list, K: int) -> tuple:
     for back in BACKTEST_CUTS_H:
         cut = [s for s in snaps if s[0] <= last_t - back]
         if len(cut) >= 3:
-            f = Fit(cut, n0, c0, K)
+            f = Fit(cut, n0, c0, kinds)
             if f.ok:
                 fits.append(f)
     if not fits:
@@ -269,7 +295,8 @@ def forecast_case(case: dict) -> dict:
     else:
         n0, c0 = 0, [0] * K
 
-    model = Fit(snaps, n0, c0, K)
+    kinds = [trophy_kind(t) for t in trophies]
+    model = Fit(snaps, n0, c0, kinds)
     if not model.ok:
         return young_forecast(trophies, last_rates)
 
@@ -279,8 +306,13 @@ def forecast_case(case: dict) -> dict:
     gap = gaps[len(gaps) // 2] if gaps else 3.0
     target_eff = target_h - min(max(gap, 0.5), 12.0) / 2
 
-    decay_inf, decay_uninf, scale, _ = backtest(snaps, n0, c0, K)
+    decay_inf, decay_uninf, scale, _ = backtest(snaps, n0, c0, kinds)
     rows = model.predict(target_eff, decay_inf, decay_uninf, scale)
+    # The platinum needs every other trophy: no quantile above the rarest other trophy's.
+    others = [rows[k] for k in range(K) if trophies[k]["tier"] != "platinum"]
+    for k, t in enumerate(trophies):
+        if t["tier"] == "platinum" and others:
+            rows[k] = [min([v] + [o[i] for o in others]) for i, v in enumerate(rows[k])]
     return {"trophies": [{"id": t["id"], "q": q} for t, q in zip(trophies, rows)]}
 
 
