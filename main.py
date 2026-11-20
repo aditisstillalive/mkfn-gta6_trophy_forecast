@@ -39,14 +39,22 @@ Z = [ND.inv_cdf(t) for t in LEVELS]
 
 ORIGIN = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
 ORIGIN_OFFSET_H = 3.0  # u = ln(hours since ORIGIN + this): the launch wave's centre is near the origin
-FIT_WINDOW_H = 30.0
+FIT_WINDOWS_H = [30.0, 42.0, 54.0, 72.0]
 EARLY_BLOCK_MAX = 2000  # a first page with fewer players than this is the launch-night block
 INFORMATIVE_COUNT = 15  # genuine earners a trophy needs at the last page to inform the pooled velocity
-VEL_DAMP = 0.85  # velocity damping (players keep joining with no progress; sessions slow after launch week)
+# Velocity decay per unit of log time (players keep joining with no progress; play slows after launch): chosen per
+# case by a backtest on its own history, shrunk toward these priors.
+PRIOR_DECAY_INF = 1.0
+PRIOR_DECAY_UNINF = 0.6
+PRIOR_SCALE = 0.9
+DECAY_GRID = [0.0, 0.3, 0.6, 0.9, 1.2, 1.6, 2.2]
+SCALE_GRID = [0.6, 0.75, 0.9, 1.1, 1.35, 1.7, 2.2]
+PRIOR_PULL = 0.05
+BACKTEST_WEIGHT = 0.3
+BACKTEST_CUTS_H = [18.0, 24.0, 30.0]
 OWN_SHARE = 0.5  # share of a trophy's own deviation from the pooled velocity it keeps
 PLAYERS_DAMP = 0.7
 RW_SIGMA = 0.25  # probit random walk per unit of log time
-SPREAD_SCALE = 1.0
 
 
 def parse_time(s: str) -> datetime:
@@ -121,23 +129,148 @@ def young_forecast(trophies: list, last_rates: list) -> dict:
     return {"trophies": rows}
 
 
+class Fit:
+    """The model fitted on the pages up to some moment: each trophy's probit path, the pooled velocity line and
+    the trend of the players tracked."""
+
+    def __init__(self, snaps: list, n0: int, c0: list, K: int):
+        self.ok = False
+        last_t, last_n, _ = snaps[-1]
+        fit = []
+        for window in FIT_WINDOWS_H:  # widen the window when Exophase refreshed rarely
+            fit = [s for s in snaps if s[0] >= last_t - window and s[1] - n0 >= max(1000, 0.2 * (last_n - n0))]
+            if len(fit) >= 4 and fit[-1][0] - fit[0][0] >= 6:
+                break
+        if len(fit) < 3 or fit[-1][0] - fit[0][0] < 4:
+            return
+        self.ok, self.n0, self.c0, self.K, self.fit = True, n0, c0, K, fit
+        self.last_t, self.last_n = last_t, last_n
+        xs = [logu(s[0]) for s in fit]
+        ws = [1.0 + i / len(fit) for i in range(len(fit))]
+        _, self.bn, _, _ = wls(xs, [math.log(max(1, s[1] - n0)) for s in fit], ws)
+
+        self.paths = []
+        for k in range(K):
+            zs = []
+            for s in fit:
+                count, new = self.genuine(s, k)
+                zs.append(probit(min((count + 0.5) / (new + 1), 1 - 0.5 / new)))
+            _, b, sd, se = wls(xs, zs, ws)
+            count_last, new_last = self.genuine(fit[-1], k)
+            count_first, _ = self.genuine(fit[0], k)
+            self.paths.append({"z_last": zs[-1], "z_mid": sum(zs) / len(zs), "b": b, "se": se, "sd": sd,
+                               "count": count_last, "count_first": count_first, "g": count_last / new_last,
+                               "full": all(rate_of(s[2], k) >= 99.995 for s in fit)})
+        self.informative = {k for k in range(K) if self.paths[k]["count"] >= INFORMATIVE_COUNT
+                            and self.paths[k]["count_first"] >= 3 and self.paths[k]["g"] < 0.98}
+
+        inf = sorted(self.informative)
+        if len(inf) >= 4:
+            zx = [self.paths[k]["z_mid"] for k in inf]
+            vy = [self.paths[k]["b"] for k in inf]
+            vw = [1 / (self.paths[k]["se"] ** 2 + 0.01) for k in inf]
+            _, beta, _, _ = wls(zx, vy, vw)
+            beta = min(0.1, max(-0.6, beta))
+            alpha = sum(w * (y - beta * x) for w, x, y in zip(vw, zx, vy)) / sum(vw)
+            zlo, zhi = min(zx) - 0.5, max(zx) + 0.5
+            resid = sorted(abs(vy[i] - alpha - beta * zx[i]) for i in range(len(zx)))
+            vsd = max(0.1, resid[len(resid) // 2] / 0.6745)
+        elif inf:
+            vs = sorted(self.paths[k]["b"] for k in inf)
+            alpha, beta, zlo, zhi, vsd = vs[len(vs) // 2], 0.0, -9.0, 9.0, 0.5
+        else:
+            alpha, beta, zlo, zhi, vsd = 0.5, 0.0, -9.0, 9.0, 0.8
+        self.alpha, self.beta, self.zlo, self.zhi, self.vsd = alpha, beta, zlo, zhi, vsd
+
+    def genuine(self, s, k):
+        new = max(1, s[1] - self.n0)
+        return max(0.0, rate_of(s[2], k) * s[1] / 100 - self.c0[k]), new
+
+    def velocity(self, z: float) -> float:
+        return self.alpha + self.beta * min(self.zhi, max(self.zlo, z))
+
+    def predict(self, target_h: float, decay_inf: float, decay_uninf: float, scale: float) -> list:
+        """Five rate quantiles (percent) per trophy for the page at target_h."""
+        du = max(0.0, logu(target_h) - logu(self.last_t))
+        n_new_t = (self.last_n - self.n0) * math.exp(PLAYERS_DAMP * max(0.0, self.bn) * du)
+        n_t = self.n0 + n_new_t
+        out = []
+        for k in range(self.K):
+            p = self.paths[k]
+            if p["full"]:
+                out.append([99.95, 100, 100, 100, 100])
+                continue
+            informative = k in self.informative
+            own = (p["b"] - self.velocity(p["z_mid"])) * OWN_SHARE if informative else 0.0
+            # The velocity decays exponentially along log time (new players join with no progress, play slows).
+            decay = decay_inf if informative else decay_uninf
+            z, steps = p["z_last"], 40
+            for i in range(steps):
+                z += math.exp(-decay * du * (i + 0.5) / steps) * (self.velocity(z) + own) * du / steps
+            extra = 0.0 if informative else 0.4
+            sd = scale * math.sqrt((self.vsd * du) ** 2 + RW_SIGMA**2 * du + p["sd"] ** 2 + (extra * du) ** 2 + 0.01)
+            out.append([100 * (self.c0[k] + ND.cdf(z + zq * sd) * n_new_t) / n_t for zq in Z])
+        return out
+
+
+def pinball_logit(y: float, q: float, tau: float) -> float:
+    d = logit_pct(y) - logit_pct(q)
+    return 2 * max(tau * d, (tau - 1) * d)
+
+
+def backtest(snaps: list, n0: int, c0: list, K: int) -> tuple:
+    """Choose the velocity decay (informative and thin trophies) and the spread scale by forecasting the last
+    page from earlier cuts of this very history, scored with the contest's own loss; shrunk toward the prior."""
+    last_t, _, last_rates = snaps[-1]
+    fits = []
+    for back in BACKTEST_CUTS_H:
+        cut = [s for s in snaps if s[0] <= last_t - back]
+        if len(cut) >= 3:
+            f = Fit(cut, n0, c0, K)
+            if f.ok:
+                fits.append(f)
+    if not fits:
+        return PRIOR_DECAY_INF, PRIOR_DECAY_UNINF, PRIOR_SCALE, 0
+
+    def loss(di: float, du_: float, sc: float) -> float:
+        total, n = 0.0, 0
+        for f in fits:
+            for k, q in enumerate(f.predict(last_t, di, du_, sc)):
+                y = rate_of(last_rates, k)
+                total += sum(pinball_logit(y, qt, tau) for tau, qt in zip(LEVELS, q))
+                n += 5
+        return total / n
+
+    best = None
+    for di in DECAY_GRID:
+        for du_ in DECAY_GRID:
+            l = loss(di, du_, PRIOR_SCALE) + PRIOR_PULL * ((di - PRIOR_DECAY_INF) ** 2 + (du_ - PRIOR_DECAY_UNINF) ** 2) / 4
+            if best is None or l < best[0]:
+                best = (l, di, du_)
+    _, di, du_ = best
+    best_sc = min(SCALE_GRID, key=lambda sc: loss(di, du_, sc) + PRIOR_PULL * math.log(sc / PRIOR_SCALE) ** 2)
+    w = BACKTEST_WEIGHT
+    return (w * di + (1 - w) * PRIOR_DECAY_INF, w * du_ + (1 - w) * PRIOR_DECAY_UNINF,
+            math.exp(w * math.log(best_sc) + (1 - w) * math.log(PRIOR_SCALE)), len(fits))
+
+
 def forecast_case(case: dict) -> dict:
     trophies = case["trophies"]
     K = len(trophies)
     snaps = snapshots(case["history"])
     target_h = hours_since_origin(parse_time(case["target"]))
     at_h = hours_since_origin(parse_time(case["at"]))
-    last_t, last_n, last_rates = snaps[-1]
+    last_rates = snaps[-1][2]
 
     # The launch-night block: its counts stay put.
-    first_t, first_n, first_rates = snaps[0]
+    _, first_n, first_rates = snaps[0]
     if first_n < EARLY_BLOCK_MAX:
         n0, c0 = first_n, [round(rate_of(first_rates, k) * first_n / 100) for k in range(K)]
     else:
         n0, c0 = 0, [0] * K
 
-    fit = [s for s in snaps if s[0] >= last_t - FIT_WINDOW_H and s[1] - n0 >= max(1000, 0.2 * (last_n - n0))]
-    if len(fit) < 3 or fit[-1][0] - fit[0][0] < 4:
+    model = Fit(snaps, n0, c0, K)
+    if not model.ok:
         return young_forecast(trophies, last_rates)
 
     # Expected staleness at the target: half the typical gap between refreshes.
@@ -145,78 +278,10 @@ def forecast_case(case: dict) -> dict:
     gaps = sorted(b - a for a, b in zip(recent, recent[1:]))
     gap = gaps[len(gaps) // 2] if gaps else 3.0
     target_eff = target_h - min(max(gap, 0.5), 12.0) / 2
-    du = max(0.0, logu(target_eff) - logu(last_t))
 
-    xs = [logu(s[0]) for s in fit]
-    ws = [1.0 + i / len(fit) for i in range(len(fit))]
-
-    # Players tracked at the target: the log-log trend of the new players, damped.
-    _, bn, _, _ = wls(xs, [math.log(max(1, s[1] - n0)) for s in fit], ws)
-    n_new_t = (last_n - n0) * math.exp(PLAYERS_DAMP * max(0.0, bn) * du)
-    n_t = n0 + n_new_t
-
-    def genuine(s, k):
-        new = max(1, s[1] - n0)
-        count = rate_of(s[2], k) * s[1] / 100 - c0[k]
-        return max(0.0, count), new
-
-    # Each trophy's probit path over the window.
-    paths = []
-    for k in range(K):
-        zs = []
-        for s in fit:
-            count, new = genuine(s, k)
-            g = (count + 0.5) / (new + 1)
-            zs.append(probit(min(g, 1 - 0.5 / new)))
-        a, b, sd, se = wls(xs, zs, ws)
-        count_last, new_last = genuine(fit[-1], k)
-        count_first, _ = genuine(fit[0], k)
-        paths.append({"z_last": zs[-1], "z_mid": sum(zs) / len(zs), "b": b, "se": se, "sd": sd,
-                      "count": count_last, "count_first": count_first, "g": count_last / new_last})
-
-    informative = [k for k in range(K) if paths[k]["count"] >= INFORMATIVE_COUNT and paths[k]["count_first"] >= 3
-                   and paths[k]["g"] < 0.98]
-
-    # Pooled velocity v(z) = alpha + beta z over the informative trophies.
-    if len(informative) >= 4:
-        zx = [paths[k]["z_mid"] for k in informative]
-        vy = [paths[k]["b"] for k in informative]
-        vw = [1 / (paths[k]["se"] ** 2 + 0.01) for k in informative]
-        alpha, beta, vsd, _ = wls(zx, vy, vw)
-        beta = min(0.1, max(-0.6, beta))
-        mzx = sum(w * x for w, x in zip(vw, zx)) / sum(vw)
-        mvy = sum(w * y for w, y in zip(vw, vy)) / sum(vw)
-        alpha = mvy - beta * mzx
-        zlo, zhi = min(zx) - 0.5, max(zx) + 0.5
-        resid = sorted(abs(vy[i] - alpha - beta * zx[i]) for i in range(len(zx)))
-        vsd = max(0.1, resid[len(resid) // 2] / 0.6745)
-    elif informative:
-        vs = sorted(paths[k]["b"] for k in informative)
-        alpha, beta, zlo, zhi, vsd = vs[len(vs) // 2], 0.0, -9.0, 9.0, 0.5
-    else:
-        alpha, beta, zlo, zhi, vsd = 0.5, 0.0, -9.0, 9.0, 0.8
-
-    def velocity(z: float) -> float:
-        return alpha + beta * min(zhi, max(zlo, z))
-
-    rows = []
-    for k, t in enumerate(trophies):
-        p = paths[k]
-        if all(rate_of(s[2], k) >= 99.995 for s in fit):
-            rows.append({"id": t["id"], "q": [99.95, 100, 100, 100, 100]})
-            continue
-        own = (p["b"] - velocity(p["z_mid"])) * (OWN_SHARE if k in informative else 0.0)
-        z, steps = p["z_last"], 40
-        for _ in range(steps):
-            z += VEL_DAMP * (velocity(z) + own) * du / steps
-        extra = 0.0 if k in informative else 0.4
-        sd = SPREAD_SCALE * math.sqrt((vsd * du) ** 2 + RW_SIGMA**2 * du + p["sd"] ** 2 + (extra * du) ** 2 + 0.01)
-        q = []
-        for zq in Z:
-            g = ND.cdf(z + zq * sd)
-            q.append(100 * (c0[k] + g * n_new_t) / n_t)
-        rows.append({"id": t["id"], "q": q})
-    return {"trophies": rows}
+    decay_inf, decay_uninf, scale, _ = backtest(snaps, n0, c0, K)
+    rows = model.predict(target_eff, decay_inf, decay_uninf, scale)
+    return {"trophies": [{"id": t["id"], "q": q} for t, q in zip(trophies, rows)]}
 
 
 def finish(q: list) -> list:
