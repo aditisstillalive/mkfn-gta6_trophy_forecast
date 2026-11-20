@@ -14,6 +14,7 @@ writes <out dir>/s<seed>.in (case) and <out dir>/s<seed>.ans (answer rates)
 """
 
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,7 +77,14 @@ def scenario(seed: int, base: dict) -> tuple[dict, dict]:
     tracked = start + rng.exponential(lag_mean, n_players)
     v = np.exp(rng.normal(np.log(intensity), 0.5, n_players)) * np.where(wave, 1.25, 0.85)
     v = np.minimum(v, 0.75)
-    skill = np.exp(rng.normal(0, 0.35, n_players))
+    # SIM_VARIANT=fade: a world unlike the forecaster's assumptions: play fades as the novelty wears off (hours
+    # played saturate at v x tau) and skill has heavy tails.
+    fade = os.environ.get("SIM_VARIANT") == "fade"
+    if fade:
+        skill = np.exp(0.35 * rng.standard_t(3, n_players))
+        tau = rng.uniform(60, 150, n_players)
+    else:
+        skill = np.exp(rng.normal(0, 0.35, n_players))
     g = rng.normal(0, 1, n_players)
 
     need = np.array([REQ[i][0] for i in ids]) * pace * np.exp(rng.normal(0, 0.35, k))
@@ -93,7 +101,11 @@ def scenario(seed: int, base: dict) -> tuple[dict, dict]:
             continue
         latent = 0.6 * g + 0.8 * rng.normal(0, 1, n_players)
         engaged = latent < NormalDist().inv_cdf(min(p[j], 0.9999))
-        e = start + need[j] * skill / v
+        if fade:
+            frac = need[j] * skill / (v * tau)
+            e = start + np.where(frac < 1, -tau * np.log(np.clip(1 - frac, 1e-12, 1)), np.inf)
+        else:
+            e = start + need[j] * skill / v
         earn[j] = np.where(engaged, np.maximum(e, tracked), np.inf)
     earn.sort(axis=1)
     tracked_sorted = np.sort(tracked)

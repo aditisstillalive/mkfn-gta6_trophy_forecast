@@ -316,8 +316,11 @@ def forecast_case(case: dict) -> dict:
     return {"trophies": [{"id": t["id"], "q": q} for t, q in zip(trophies, rows)]}
 
 
-def finish(q: list) -> list:
-    """Round to 4 decimals, clamp to [0, 100], and keep the five non-decreasing."""
+def finish(q: list, fallback: list) -> list:
+    """Round to 4 decimals, clamp to [0, 100], and keep the five non-decreasing; a non-finite value (which the model
+    should never write) takes the whole fallback row."""
+    if len(q) != 5 or not all(isinstance(x, (int, float)) and math.isfinite(x) for x in q):
+        q = fallback
     out, prev = [], 0.0
     for x in q:
         v = max(round(min(100.0, max(0.0, x)), 4), prev)
@@ -326,13 +329,35 @@ def finish(q: list) -> list:
     return out
 
 
+def safe_rows(case: dict) -> dict:
+    """The forecast to fall back on, trophy by trophy: the last rate with a wide logit spread."""
+    history = case.get("history") or []
+    last = history[-1]["rates"] if history else []
+    out = {}
+    for k, t in enumerate(case["trophies"]):
+        r = rate_of(last, k) if last else 1.0
+        out[t["id"]] = [99.95, 100, 100, 100, 100] if r >= 99.995 else [inv_logit_pct(logit_pct(r) + z) for z in Z]
+    return out
+
+
+def run_case(case: dict) -> dict:
+    """The model's forecast, made valid whatever happens: one row per trophy, five finite non-decreasing numbers."""
+    fallback = safe_rows(case)
+    try:
+        model_rows = {row["id"]: row["q"] for row in forecast_case(case)["trophies"]}
+    except Exception as exc:  # never leave a case invalid
+        print(f"{case.get('id')}: model failed ({exc!r}), falling back", file=sys.stderr)
+        model_rows = {}
+    rows = [{"id": t["id"], "q": finish(model_rows.get(t["id"], fallback[t["id"]]), fallback[t["id"]])}
+            for t in case["trophies"]]
+    return {"trophies": rows}
+
+
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case)
-        for row in forecast["trophies"]:
-            row["q"] = finish(row["q"])
+        forecast = run_case(case)
         (OUTPUT_DIR / f"{path.stem}.out").write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
